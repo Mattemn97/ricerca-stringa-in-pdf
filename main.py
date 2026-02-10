@@ -135,6 +135,7 @@ def guided_flow():
     print(f"✔ File con la stringa/regex: {len(found)} → {out_yes}")
     print(f"✘ File senza: {len(not_found)} → {out_no}")
     print("\nFatto! Report generati.")
+    input("\nPremi un tasto per proseguire...")
 
 
 # ---------------- Entrypoint ----------------
