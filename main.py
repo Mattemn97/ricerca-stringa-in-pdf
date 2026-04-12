@@ -1,142 +1,228 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ricerca di una stringa all'interno di uno o più PDF (anche ricorsiva).
-Supporta sia ricerca semplice che ricerca tramite REGEX.
-
-- Analizza singolo PDF o cartella (con sottocartelle)
-- Usa PyPDF2 per estrarre il testo
-- Barra di progresso (tqdm)
-- Supporto REGEX opzionale
-- Genera:
-      • File con la stringa.txt
-      • File senza stringa.txt
+Modulo per l'analisi e la ricerca testuale (Standard e REGEX) all'interno di documenti PDF.
+Include interfaccia CLI basata su 'rich' e logging avanzato.
 """
 
-import os
 import re
-from tqdm import tqdm
+from pathlib import Path
+from typing import List
+
 from PyPDF2 import PdfReader
+from rich.console import Console
+from rich.table import Table
+from rich.prompt import Prompt, Confirm
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeRemainingColumn,
+)
+
+# Importazione del logger aziendale
+from custom_logger import logger
 
 
-# ---------------- Estrazione testo PDF ----------------
-def extract_text_from_pdf(pdf_path):
-    """Estrae il testo da un PDF. Ritorna stringa vuota in caso di errore."""
+# ==========================================
+# CORE: Logica di Business
+# ==========================================
+
+def extract_text_from_pdf(pdf_path: Path) -> str:
+    """
+    Estrae il testo da un file PDF. Ritorna una stringa vuota in caso di errore di lettura.
+    
+    :param pdf_path: Percorso del file PDF.
+    :return: Testo estratto dal documento.
+    """
     try:
-        reader = PdfReader(pdf_path)
-        text = []
-        for page in reader.pages:
+        reader = PdfReader(str(pdf_path))
+        text_blocks: List[str] = []
+        
+        for page_num, page in enumerate(reader.pages):
             try:
-                text.append(page.extract_text() or "")
-            except Exception:
+                extracted = page.extract_text()
+                if extracted:
+                    text_blocks.append(extracted)
+            except Exception as e:
+                logger.debug(f"Impossibile estrarre il testo dalla pagina {page_num} del file {pdf_path.name}: {e}")
                 continue
-        return "\n".join(text)
-    except Exception:
+                
+        return "\n".join(text_blocks)
+    except Exception as e:
+        logger.error(f"Errore durante l'apertura o la lettura del file {pdf_path.name}: {e}")
         return ""
 
 
-# ---------------- Ricerca stringa normale ----------------
-def search_simple(text, needle):
-    """Ricerca semplice (case-insensitive)."""
-    return needle.lower() in text.lower()
-
-
-# ---------------- Ricerca tramite REGEX ----------------
-def search_regex(text, pattern):
-    """Ricerca REGEX (case-insensitive)."""
-    try:
-        return re.search(pattern, text, re.IGNORECASE) is not None
-    except re.error:
+def evaluate_search_criteria(text: str, pattern: str, use_regex: bool) -> bool:
+    """
+    Valuta se il criterio di ricerca è presente nel testo fornito.
+    
+    :param text: Il contenuto testuale da analizzare.
+    :param pattern: La stringa o l'espressione regolare da cercare.
+    :param use_regex: Booleano che determina se utilizzare logica REGEX.
+    :return: True se il criterio è soddisfatto, False altrimenti.
+    """
+    if not text:
         return False
 
-
-# ---------------- Ricerca in PDF ----------------
-def search_in_pdf(pdf_path, needle, use_regex):
-    """Ritorna True se la stringa (o regex) è presente nel PDF."""
-    text = extract_text_from_pdf(pdf_path)
     if use_regex:
-        return search_regex(text, needle)
+        try:
+            return re.search(pattern, text, re.IGNORECASE) is not None
+        except re.error as e:
+            logger.error(f"Errore di sintassi nell'espressione regolare '{pattern}': {e}")
+            return False
     else:
-        return search_simple(text, needle)
+        return pattern.lower() in text.lower()
 
 
-# ---------------- Scansione ricorsiva ----------------
-def get_all_pdfs_recursive(folder_path):
-    """Ritorna lista di TUTTI i PDF dentro la cartella (ricorsivamente)."""
-    pdfs = []
-    for root, _, files in os.walk(folder_path):
-        for f in files:
-            if f.lower().endswith(".pdf"):
-                pdfs.append(os.path.join(root, f))
-    return pdfs
+def discover_pdf_files(target_path: Path) -> List[Path]:
+    """
+    Identifica tutti i documenti PDF presenti nel percorso specificato.
+    Se il percorso è una directory, effettua una ricerca ricorsiva.
+    
+    :param target_path: Percorso del file o della cartella.
+    :return: Lista di percorsi (Path) ai file PDF validi.
+    """
+    if target_path.is_file():
+        if target_path.suffix.lower() == ".pdf":
+            return [target_path]
+        return []
+    elif target_path.is_dir():
+        return [p for p in target_path.rglob("*") if p.is_file() and p.suffix.lower() == ".pdf"]
+    return []
 
 
-# ---------------- Flusso guidato ----------------
-def guided_flow():
-    os.system('cls' if os.name == 'nt' else 'clear')
-    print("— Ricerca stringa/REGEX nei PDF (ricorsiva) —\n")
+# ==========================================
+# INTERFACCIA: Logica UI e Flusso di Esecuzione
+# ==========================================
 
-    # 1) Vuoi usare REGEX?
-    use_regex = input("Vuoi usare una REGEX? [s/N]: ").strip().lower() in ("s", "si", "y", "yes")
+def main() -> None:
+    """
+    Punto di ingresso principale dell'applicazione. Gestisce l'interazione utente,
+    la raccolta degli input e la presentazione dei risultati.
+    """
+    console = Console()
+    console.clear()
 
-    # 2) Inserimento criterio
-    if use_regex:
-        needle = input("1) Inserisci la REGEX da cercare: ").strip()
-    else:
-        needle = input("1) Inserisci la stringa da cercare: ").strip()
+    # Banner di Benvenuto
+    console.print("[bold cyan]--- STRUMENTO DI RICERCA DOCUMENTALE AVANZATA PDF ---[/bold cyan]\n")
+    logger.info("Avvio del modulo di ricerca documentale PDF.")
 
-    if not needle:
-        print("❌ Nessun valore inserito. Interrompo.")
+    # 1. Configurazione Criteri di Ricerca
+    use_regex = Confirm.ask("Utilizzare espressioni regolari (REGEX) per la ricerca?")
+    logger.debug(f"Modalita REGEX selezionata dall'utente: {use_regex}")
+
+    prompt_msg = "Inserire l'espressione regolare da cercare" if use_regex else "Inserire la stringa da cercare"
+    search_pattern = Prompt.ask(prompt_msg).strip().strip('"')
+
+    if not search_pattern:
+        logger.warning("Esecuzione interrotta: Nessun criterio di ricerca inserito.")
+        console.print("[bold red]Errore: Il criterio di ricerca non puo essere vuoto. Operazione annullata.[/bold red]")
         return
 
-    # 3) Percorso
+    # 2. Configurazione Percorso
     while True:
-        path = input("\n2) Inserisci percorso PDF o cartella: ").strip()
-        if os.path.isfile(path) and path.lower().endswith(".pdf"):
-            pdf_files = [path]
+        path_input = Prompt.ask("Inserire il percorso del file o della cartella da analizzare").strip().strip('"')
+        target_path = Path(path_input)
+
+        if target_path.exists():
             break
-        elif os.path.isdir(path):
-            pdf_files = get_all_pdfs_recursive(path)
-            if not pdf_files:
-                print("❌ Nessun PDF trovato (nemmeno nelle sottocartelle). Riprova.")
-                continue
-            break
-        else:
-            print("❌ Percorso non valido. Riprova.")
+        
+        logger.warning(f"L'utente ha inserito un percorso non valido: {path_input}")
+        console.print("[bold red]Errore: Il percorso specificato non esiste. Riprovare.[/bold red]")
 
-    print(f"\n📄 PDF trovati: {len(pdf_files)}\n")
+    # 3. Identificazione dei file
+    logger.info(f"Avvio della scansione per i file PDF nel percorso: {target_path.resolve()}")
+    pdf_files = discover_pdf_files(target_path)
 
-    # 4) File output
-    out_yes = "File con la stringa.txt"
-    out_no = "File senza stringa.txt"
+    if not pdf_files:
+        logger.warning("Scansione terminata: Nessun file PDF rilevato nel percorso.")
+        console.print("[bold yellow]Attenzione: Nessun documento PDF trovato nel percorso indicato. Uscita.[/bold yellow]")
+        return
 
-    found = []
-    not_found = []
+    # 4. Tabella di Riepilogo
+    summary_table = Table(title="Riepilogo Parametri di Elaborazione", header_style="bold magenta")
+    summary_table.add_column("Parametro", style="dim")
+    summary_table.add_column("Valore")
 
-    # 5) Analisi
-    desc = "Analisi PDF (REGEX)" if use_regex else "Analisi PDF"
-    for pdf in tqdm(pdf_files, desc=desc, unit="file"):
-        if search_in_pdf(pdf, needle, use_regex):
-            found.append(pdf)
-        else:
-            not_found.append(pdf)
+    summary_table.add_row("Percorso Selezionato", str(target_path.resolve()))
+    summary_table.add_row("Modalita di Ricerca", "Espressione Regolare (REGEX)" if use_regex else "Testo Semplice")
+    summary_table.add_row("Criterio di Ricerca", search_pattern)
+    summary_table.add_row("Totale Documenti da Analizzare", str(len(pdf_files)))
 
-    # 6) Scrittura risultati
-    with open(out_yes, "w", encoding="utf-8") as f:
-        for p in found:
-            f.write(p + "\n")
+    console.print("\n")
+    console.print(summary_table)
+    console.print("\n")
 
-    with open(out_no, "w", encoding="utf-8") as f:
-        for p in not_found:
-            f.write(p + "\n")
+    if not Confirm.ask("Procedere con l'elaborazione dei documenti?"):
+        logger.info("L'operazione e stata annullata dall'utente in fase di conferma.")
+        console.print("Operazione annullata.")
+        return
 
-    # 7) Report
-    print("\n— RISULTATO —")
-    print(f"✔ File con la stringa/regex: {len(found)} → {out_yes}")
-    print(f"✘ File senza: {len(not_found)} → {out_no}")
-    print("\nFatto! Report generati.")
+    # 5. Elaborazione con Barra di Progresso
+    found_pdfs: List[Path] = []
+    not_found_pdfs: List[Path] = []
+
+    logger.info("Avvio dell'elaborazione massiva dei documenti.")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        
+        task_id = progress.add_task("[cyan]Analisi dei documenti in corso...", total=len(pdf_files))
+
+        for pdf_path in pdf_files:
+            logger.debug(f"Inizio analisi del file: {pdf_path.name}")
+            extracted_content = extract_text_from_pdf(pdf_path)
+
+            if evaluate_search_criteria(extracted_content, search_pattern, use_regex):
+                found_pdfs.append(pdf_path)
+            else:
+                not_found_pdfs.append(pdf_path)
+
+            progress.advance(task_id)
+
+    # 6. Scrittura dei file di Output
+    output_found = Path("documenti_con_corrispondenza.txt")
+    output_missing = Path("documenti_senza_corrispondenza.txt")
+
+    try:
+        with output_found.open("w", encoding="utf-8") as f_out:
+            for p in found_pdfs:
+                f_out.write(f"{p.resolve()}\n")
+
+        with output_missing.open("w", encoding="utf-8") as f_out:
+            for p in not_found_pdfs:
+                f_out.write(f"{p.resolve()}\n")
+                
+        logger.info("Salvataggio dei file di report completato con successo.")
+    except Exception as e:
+        logger.critical(f"Errore: {e}", exc_info=True)
+        console.print("[bold red]Errore critico durante la scrittura dei report di output. Consultare i log.[/bold red]")
+        return
+
+    # 7. Report Finale
+    logger.info("Elaborazione conclusa con successo.")
+    console.print("\n[bold green]--- ELABORAZIONE COMPLETATA ---[/bold green]")
+    console.print(f"Documenti contenenti il criterio: [bold cyan]{len(found_pdfs)}[/bold cyan] (Report: {output_found.name})")
+    console.print(f"Documenti non contenenti il criterio: [bold cyan]{len(not_found_pdfs)}[/bold cyan] (Report: {output_missing.name})")
+    console.print("\nOperazione terminata.")
 
 
-# ---------------- Entrypoint ----------------
 if __name__ == "__main__":
-    guided_flow()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Esecuzione interrotta manualmente dall'utente (KeyboardInterrupt).")
+        Console().print("\n[bold yellow]Elaborazione interrotta dall'utente.[/bold yellow]")
+    except Exception as unexpected_exception:
+        logger.critical(f"Errore: {unexpected_exception}", exc_info=True)
+        Console().print("\n[bold red]Si è verificato un errore di sistema irreversibile. Consultare i file di log.[/bold red]")
